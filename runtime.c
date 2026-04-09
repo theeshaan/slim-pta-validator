@@ -347,5 +347,6 @@ void __pta_check_deref(const char *ptr_var_name, void *addr) {
 
   // Exit with failure to clearly signal unsoundness
   // (change to a counter increment if you want to collect all violations)
-  exit(1);
+  // E: I'm commenting it out bcz I want to see all violations, not just the first one.
+  // exit(1);
 }

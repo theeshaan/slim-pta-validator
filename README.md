@@ -40,3 +40,6 @@ The LLVM IR (`.ll`) file is expected to have been compiled with the following op
 - `-fno-discard-value-names`
 
 LLVM version 17+ is to be used for the compilation.
+
+## Work in progress
+This is a work in progress, currently only supports flow-insensitive pointer analyses.
