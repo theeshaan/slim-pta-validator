@@ -35,6 +35,7 @@
 
 #include <fstream>
 #include <map>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -425,26 +426,63 @@ private:
     // Loads: load T, ptr %p  — the pointer operand is what we check
     for (LoadInst *LI : Loads) {
       Value *PtrOp = LI->getPointerOperand();
-      std::string name = getValueName(PtrOp);
-      if (!isKnownPointer(name))
+      std::optional<std::string> PtrName = inferPointerNameForDeref(PtrOp);
+      if (!PtrName)
         continue;
 
       B.SetInsertPoint(LI);
-      Value *NameStr = makeStringPtr(B, M, name);
+      Value *NameStr = makeStringPtr(B, M, *PtrName);
       B.CreateCall(RF.CheckDeref, {NameStr, PtrOp});
     }
 
     // Stores: store T val, ptr %p  — the pointer operand is the destination
     for (StoreInst *SI : Stores) {
       Value *PtrOp = SI->getPointerOperand();
-      std::string name = getValueName(PtrOp);
-      if (!isKnownPointer(name))
+      std::optional<std::string> PtrName = inferPointerNameForDeref(PtrOp);
+      if (!PtrName)
         continue;
 
       B.SetInsertPoint(SI);
-      Value *NameStr = makeStringPtr(B, M, name);
+      Value *NameStr = makeStringPtr(B, M, *PtrName);
       B.CreateCall(RF.CheckDeref, {NameStr, PtrOp});
     }
+  }
+
+  // Infer the abstract pointer variable name that should be used for a
+  // dereference check at address `DerefAddr`.
+  //
+  // Key distinction:
+  //   - Accessing `%p` itself (where `%p` is an alloca/global slot storing a
+  //     pointer) is NOT a dereference through pointer `%p`.
+  //   - Accessing the loaded pointer value from `%p` IS a dereference through
+  //     `%p`.
+  //
+  // We therefore map:
+  //   - direct pointer values (arguments, phi, etc.) that are known pointers
+  //   - and loaded values where the load source is a known pointer variable
+  // to the corresponding `%p` / `@gptr` name.
+  std::optional<std::string> inferPointerNameForDeref(Value *DerefAddr) const {
+    Value *V = DerefAddr->stripPointerCasts();
+
+    // Direct pointer value (e.g. function parameter `%p`) — but never treat
+    // an alloca/global pointer slot itself as a dereference target.
+    std::string DirectName = getValueName(V);
+    if (isKnownPointer(DirectName) && !isa<AllocaInst>(V) &&
+        !isa<GlobalVariable>(V)) {
+      return DirectName;
+    }
+
+    // Typical lowered C pattern:
+    //   %tmp = load ptr, ptr %p
+    //   load/store ..., ptr %tmp
+    if (auto *LI = dyn_cast<LoadInst>(V)) {
+      Value *Source = LI->getPointerOperand()->stripPointerCasts();
+      std::string SourceName = getValueName(Source);
+      if (isKnownPointer(SourceName))
+        return SourceName;
+    }
+
+    return std::nullopt;
   }
 
   // ----------------------------------------------------------------

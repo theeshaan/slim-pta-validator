@@ -69,6 +69,23 @@ static PtaEntry  *pta_table[HASH_TABLE_SIZE];   // Structure 1
 static AllocEntry *alloc_table[HASH_TABLE_SIZE]; // Structure 2
 
 static int runtime_initialized = 0;
+static unsigned long unsound_count = 0;
+
+static void report_validation_summary(void) {
+  if (!runtime_initialized)
+    return;
+
+  if (unsound_count == 0) {
+    fprintf(stderr,
+            "[PtaRuntime] SUCCESS: no UNSOUND dereference observed during "
+            "execution.\n");
+  } else {
+    fprintf(stderr,
+            "[PtaRuntime] FAILURE: observed %lu UNSOUND dereference(s) during "
+            "execution.\n",
+            unsound_count);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Simple djb2 hash
@@ -211,8 +228,10 @@ void __pta_init(const char *pta_file_path) {
   if (runtime_initialized) return;
   memset(pta_table, 0, sizeof(pta_table));
   memset(alloc_table, 0, sizeof(alloc_table));
+  unsound_count = 0;
   parse_pta_file(pta_file_path);
   runtime_initialized = 1;
+  atexit(report_validation_summary);
   fprintf(stderr, "[PtaRuntime] Initialized from: %s\n", pta_file_path);
 }
 
@@ -322,6 +341,7 @@ void __pta_check_deref(const char *ptr_var_name, void *addr) {
   }
 
   // None of the pointee ranges covered this address — UNSOUND!
+  unsound_count++;
   fprintf(stderr,
           "[PtaRuntime] UNSOUND: pointer '%s' dereferenced address %p, "
           "which is not within any expected pointee allocation.\n"
