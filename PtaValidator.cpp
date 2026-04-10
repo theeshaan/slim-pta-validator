@@ -99,6 +99,10 @@ static PtaMap parsePtaFile(const std::string &path) {
     };
     ltrim(lhs);
     rtrim(lhs);
+    if (lhs.empty())
+      continue;
+
+    result[lhs];
 
     // Parse space-separated pointees from rhs
     std::istringstream iss(rhs);
