@@ -57,18 +57,47 @@ static cl::opt<std::string> OutputIR("o", cl::desc("Output IR file"),
                                       cl::value_desc("filename"),
                                       cl::init("instrumented.ll"));
 
+enum class PtaModeKind {
+  FI = 0,
+  FS = 1,
+};
+
+static cl::opt<PtaModeKind> PtaMode(
+    "pta-mode", cl::desc("Select PTA validation mode"),
+    cl::values(clEnumValN(PtaModeKind::FI, "fi", "Flow-insensitive PTA"),
+               clEnumValN(PtaModeKind::FS, "fs", "Flow-sensitive PTA")),
+    cl::init(PtaModeKind::FI));
+
 // ---------------------------------------------------------------------------
 // Points-to file parser
 // ---------------------------------------------------------------------------
 
-// Represents the static points-to map: pointer name -> set of pointee names
-using PtaMap = std::map<std::string, std::set<std::string>>;
+struct ParsedPtaData {
+  std::set<std::string> PointerNames;
+  std::set<std::string> PointeeNames;
+  std::size_t FactCount = 0;
+};
 
-// Parse lines of the form:
-//   %p -> %x %y %z
-//   @gptr -> @ga @gb
-static PtaMap parsePtaFile(const std::string &path) {
-  PtaMap result;
+static std::string trimCopy(std::string s) {
+  auto begin = s.find_first_not_of(" \t\r\n");
+  if (begin == std::string::npos)
+    return "";
+
+  auto end = s.find_last_not_of(" \t\r\n");
+  return s.substr(begin, end - begin + 1);
+}
+
+static std::vector<std::string> splitTokens(const std::string &s) {
+  std::vector<std::string> tokens;
+  std::istringstream iss(s);
+  std::string token;
+  while (iss >> token)
+    tokens.push_back(token);
+  return tokens;
+}
+
+static ParsedPtaData parseFiPtaFile(const std::string &path) {
+  ParsedPtaData result;
   std::ifstream f(path);
   if (!f.is_open()) {
     errs() << "[PtaValidator] ERROR: Cannot open points-to file: " << path
@@ -78,41 +107,71 @@ static PtaMap parsePtaFile(const std::string &path) {
 
   std::string line;
   while (std::getline(f, line)) {
-    // Skip empty lines and comments
-    if (line.empty() || line[0] == '#')
+    auto commentPos = line.find('#');
+    if (commentPos != std::string::npos)
+      line.erase(commentPos);
+    line = trimCopy(line);
+    if (line.empty())
       continue;
-
-    // Split on "->"
     auto arrowPos = line.find("->");
     if (arrowPos == std::string::npos)
       continue;
 
-    std::string lhs = line.substr(0, arrowPos);
+    std::string lhs = trimCopy(line.substr(0, arrowPos));
     std::string rhs = line.substr(arrowPos + 2);
-
-    // Trim whitespace from lhs
-    auto ltrim = [](std::string &s) {
-      s.erase(0, s.find_first_not_of(" \t\r\n"));
-    };
-    auto rtrim = [](std::string &s) {
-      s.erase(s.find_last_not_of(" \t\r\n") + 1);
-    };
-    ltrim(lhs);
-    rtrim(lhs);
     if (lhs.empty())
       continue;
 
-    result[lhs];
-
-    // Parse space-separated pointees from rhs
-    std::istringstream iss(rhs);
-    std::string token;
-    while (iss >> token) {
-      result[lhs].insert(token);
-    }
+    result.PointerNames.insert(lhs);
+    for (const std::string &token : splitTokens(rhs))
+      result.PointeeNames.insert(token);
+    result.FactCount++;
   }
 
   return result;
+}
+
+static ParsedPtaData parseFsPtaFile(const std::string &path) {
+  ParsedPtaData result;
+  std::ifstream f(path);
+  if (!f.is_open()) {
+    errs() << "[PtaValidator] ERROR: Cannot open points-to file: " << path
+           << "\n";
+    std::exit(1);
+  }
+
+  std::string line;
+  while (std::getline(f, line)) {
+    auto commentPos = line.find('#');
+    if (commentPos != std::string::npos)
+      line.erase(commentPos);
+    line = trimCopy(line);
+    if (line.empty())
+      continue;
+
+    auto arrowPos = line.find("->");
+    if (arrowPos == std::string::npos)
+      continue;
+
+    std::string lhs = trimCopy(line.substr(0, arrowPos));
+    std::string rhs = line.substr(arrowPos + 2);
+    auto lhsTokens = splitTokens(lhs);
+    if (lhsTokens.size() != 2 || lhsTokens[0].empty() || lhsTokens[0][0] != '@')
+      continue;
+
+    result.PointerNames.insert(lhsTokens[1]);
+    for (const std::string &token : splitTokens(rhs))
+      result.PointeeNames.insert(token);
+    result.FactCount++;
+  }
+
+  return result;
+}
+
+static ParsedPtaData parsePtaFile(const std::string &path, PtaModeKind mode) {
+  if (mode == PtaModeKind::FS)
+    return parseFsPtaFile(path);
+  return parseFiPtaFile(path);
 }
 
 // ---------------------------------------------------------------------------
@@ -121,10 +180,11 @@ static PtaMap parsePtaFile(const std::string &path) {
 // These functions are defined in runtime.c and linked with the instrumented
 // program. We declare them here so IRBuilder can emit calls to them.
 //
-//   void __pta_init(const char *pta_file_path);
+//   void __pta_init(const char *pta_file_path, uint64_t pta_mode);
 //   void __pta_record_alloc(const char *abstract_name, void *ptr, size_t size);
 //   void __pta_record_free(void *ptr);
-//   void __pta_check_deref(const char *ptr_var_name, void *addr);
+//   void __pta_check_deref(const char *ptr_var_name, void *addr,
+//                          const char *program_point);
 // ---------------------------------------------------------------------------
 
 static FunctionCallee getOrDeclareFunc(Module &M, const std::string &name,
@@ -133,10 +193,10 @@ static FunctionCallee getOrDeclareFunc(Module &M, const std::string &name,
 }
 
 struct RuntimeFuncs {
-  FunctionCallee PtaInit;        // __pta_init(const char*)
+  FunctionCallee PtaInit;        // __pta_init(const char*, uint64_t)
   FunctionCallee RecordAlloc;    // __pta_record_alloc(const char*, void*, size_t)
   FunctionCallee RecordFree;     // __pta_record_free(void*)
-  FunctionCallee CheckDeref;     // __pta_check_deref(const char*, void*)
+  FunctionCallee CheckDeref;     // __pta_check_deref(const char*, void*, const char*)
 };
 
 static RuntimeFuncs declareRuntimeFunctions(Module &M, LLVMContext &Ctx) {
@@ -148,7 +208,7 @@ static RuntimeFuncs declareRuntimeFunctions(Module &M, LLVMContext &Ctx) {
 
   RF.PtaInit = getOrDeclareFunc(
       M, "__pta_init",
-      FunctionType::get(VoidTy, {I8PtrTy}, false));
+      FunctionType::get(VoidTy, {I8PtrTy, SizeTy}, false));
 
   RF.RecordAlloc = getOrDeclareFunc(
       M, "__pta_record_alloc",
@@ -160,7 +220,7 @@ static RuntimeFuncs declareRuntimeFunctions(Module &M, LLVMContext &Ctx) {
 
   RF.CheckDeref = getOrDeclareFunc(
       M, "__pta_check_deref",
-      FunctionType::get(VoidTy, {I8PtrTy, I8PtrTy}, false));
+      FunctionType::get(VoidTy, {I8PtrTy, I8PtrTy, I8PtrTy}, false));
 
   return RF;
 }
@@ -192,8 +252,10 @@ static Value *makeStringPtr(IRBuilder<> &B, Module &M, const std::string &s) {
 
 class PtaValidatorPass : public PassInfoMixin<PtaValidatorPass> {
 public:
-  PtaValidatorPass(PtaMap ptaMap, std::string ptaFilePath)
-      : PtaMap_(std::move(ptaMap)), PtaFilePath_(std::move(ptaFilePath)) {}
+  PtaValidatorPass(ParsedPtaData parsedPta, std::string ptaFilePath,
+                   PtaModeKind ptaMode)
+      : ParsedPta_(std::move(parsedPta)), PtaFilePath_(std::move(ptaFilePath)),
+        PtaMode_(ptaMode) {}
 
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
     LLVMContext &Ctx = M.getContext();
@@ -227,8 +289,14 @@ public:
   }
 
 private:
-  PtaMap PtaMap_;
+  struct DerefSite {
+    Instruction *Inst;
+    std::string ProgramPoint;
+  };
+
+  ParsedPtaData ParsedPta_;
   std::string PtaFilePath_;
+  PtaModeKind PtaMode_;
 
   // The global constructor function we inject; created once, reused for globals
   Function *CtorFn_ = nullptr;
@@ -265,7 +333,9 @@ private:
     // Insert __pta_init call at the start of the ctor block (before ret)
     B.SetInsertPoint(CtorBB_);
     Value *PathStr = B.CreateGlobalStringPtr(PtaFilePath_, "__pta_filepath");
-    B.CreateCall(RF.PtaInit, {PathStr});
+    Value *ModeValue =
+        ConstantInt::get(Type::getInt64Ty(Ctx), static_cast<std::uint64_t>(PtaMode_));
+    B.CreateCall(RF.PtaInit, {PathStr, ModeValue});
 
     // Register this function as a global constructor (priority 0)
     appendToGlobalCtors(M, CtorFn_, 0);
@@ -311,25 +381,27 @@ private:
     // Collect instructions first to avoid iterator invalidation
     std::vector<AllocaInst *> Allocas;
     std::vector<CallInst *> Calls;
-    std::vector<LoadInst *> Loads;
-    std::vector<StoreInst *> Stores;
+    std::vector<DerefSite> Derefs;
+    unsigned BasicBlockIndex = 0;
 
     for (BasicBlock &BB : F) {
+      std::string BlockKey = getBasicBlockKey(BB, BasicBlockIndex++);
+      unsigned InstIndex = 0;
       for (Instruction &I : BB) {
         if (auto *AI = dyn_cast<AllocaInst>(&I))
           Allocas.push_back(AI);
         else if (auto *CI = dyn_cast<CallInst>(&I))
           Calls.push_back(CI);
-        else if (auto *LI = dyn_cast<LoadInst>(&I))
-          Loads.push_back(LI);
-        else if (auto *SI = dyn_cast<StoreInst>(&I))
-          Stores.push_back(SI);
+        else if (isa<LoadInst>(I) || isa<StoreInst>(I))
+          Derefs.push_back(
+              {&I, buildProgramPointKey(F, BlockKey, InstIndex)});
+        InstIndex++;
       }
     }
 
     instrumentAllocas(Allocas, M, B, Ctx, DL, RF);
     instrumentCalls(Calls, M, B, Ctx, RF);
-    instrumentLoadsStores(Loads, Stores, M, B, Ctx, RF);
+    instrumentDerefs(Derefs, M, B, Ctx, RF);
   }
 
   // ----------------------------------------------------------------
@@ -420,36 +492,44 @@ private:
 
   // ----------------------------------------------------------------
   // 3c. Instrument loads and stores
-  //     Before each load/store, call __pta_check_deref(ptr_name, addr)
+  //     Before each load/store, call
+  //       __pta_check_deref(ptr_name, addr, "func:block:inst_index")
   //     only if the pointer variable appears in the points-to map as a key.
   // ----------------------------------------------------------------
-  void instrumentLoadsStores(std::vector<LoadInst *> &Loads,
-                               std::vector<StoreInst *> &Stores, Module &M,
-                               IRBuilder<> &B, LLVMContext &Ctx,
-                               RuntimeFuncs &RF) {
-    // Loads: load T, ptr %p  — the pointer operand is what we check
-    for (LoadInst *LI : Loads) {
-      Value *PtrOp = LI->getPointerOperand();
+  void instrumentDerefs(std::vector<DerefSite> &Derefs, Module &M,
+                        IRBuilder<> &B, LLVMContext &Ctx, RuntimeFuncs &RF) {
+    for (const DerefSite &Site : Derefs) {
+      Instruction *I = Site.Inst;
+      Value *PtrOp = nullptr;
+      if (auto *LI = dyn_cast<LoadInst>(I))
+        PtrOp = LI->getPointerOperand();
+      else if (auto *SI = dyn_cast<StoreInst>(I))
+        PtrOp = SI->getPointerOperand();
+      else
+        continue;
+
       std::optional<std::string> PtrName = inferPointerNameForDeref(PtrOp);
       if (!PtrName)
         continue;
 
-      B.SetInsertPoint(LI);
+      B.SetInsertPoint(I);
       Value *NameStr = makeStringPtr(B, M, *PtrName);
-      B.CreateCall(RF.CheckDeref, {NameStr, PtrOp});
+      Value *ProgramPointStr = makeStringPtr(B, M, Site.ProgramPoint);
+      B.CreateCall(RF.CheckDeref, {NameStr, PtrOp, ProgramPointStr});
     }
+  }
 
-    // Stores: store T val, ptr %p  — the pointer operand is the destination
-    for (StoreInst *SI : Stores) {
-      Value *PtrOp = SI->getPointerOperand();
-      std::optional<std::string> PtrName = inferPointerNameForDeref(PtrOp);
-      if (!PtrName)
-        continue;
+  std::string getBasicBlockKey(const BasicBlock &BB,
+                               unsigned BasicBlockIndex) const {
+    if (BB.hasName())
+      return BB.getName().str();
+    return "bb" + std::to_string(BasicBlockIndex);
+  }
 
-      B.SetInsertPoint(SI);
-      Value *NameStr = makeStringPtr(B, M, *PtrName);
-      B.CreateCall(RF.CheckDeref, {NameStr, PtrOp});
-    }
+  std::string buildProgramPointKey(const Function &F,
+                                   const std::string &BlockKey,
+                                   unsigned InstIndex) const {
+    return F.getName().str() + ":" + BlockKey + ":" + std::to_string(InstIndex);
   }
 
   // Infer the abstract pointer variable name that should be used for a
@@ -466,7 +546,18 @@ private:
   //   - and loaded values where the load source is a known pointer variable
   // to the corresponding `%p` / `@gptr` name.
   std::optional<std::string> inferPointerNameForDeref(Value *DerefAddr) const {
+    return inferPointerNameForDeref(DerefAddr, 0);
+  }
+
+  std::optional<std::string> inferPointerNameForDeref(Value *DerefAddr,
+                                                      unsigned Depth) const {
+    if (Depth > 8)
+      return std::nullopt;
+
     Value *V = DerefAddr->stripPointerCasts();
+
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(V))
+      return inferPointerNameForDeref(GEP->getPointerOperand(), Depth + 1);
 
     // Direct pointer value (e.g. function parameter `%p`) — but never treat
     // an alloca/global pointer slot itself as a dereference target.
@@ -484,6 +575,7 @@ private:
       std::string SourceName = getValueName(Source);
       if (isKnownPointer(SourceName))
         return SourceName;
+      return inferPointerNameForDeref(Source, Depth + 1);
     }
 
     return std::nullopt;
@@ -495,15 +587,12 @@ private:
 
   // Is `name` a pointer variable (LHS of some entry)?
   bool isKnownPointer(const std::string &name) const {
-    return PtaMap_.count(name) > 0;
+    return ParsedPta_.PointerNames.count(name) > 0;
   }
 
   // Is `name` a pointee (RHS of any entry)?
   bool isKnownPointee(const std::string &name) const {
-    for (const auto &kv : PtaMap_)
-      if (kv.second.count(name))
-        return true;
-    return false;
+    return ParsedPta_.PointeeNames.count(name) > 0;
   }
 };
 
@@ -517,20 +606,15 @@ int main(int argc, char **argv) {
                                           "to validate points-to analysis\n");
 
   // 1. Parse the points-to file
-  PtaMap ptaMap = parsePtaFile(PtaFile);
-  if (ptaMap.empty()) {
+  ParsedPtaData parsedPta = parsePtaFile(PtaFile, PtaMode);
+  if (parsedPta.FactCount == 0) {
     errs() << "[PtaValidator] WARNING: points-to map is empty. Nothing to "
               "validate.\n";
   }
 
-  outs() << "[PtaValidator] Loaded " << ptaMap.size()
-         << " pointer entries from " << PtaFile << "\n";
-  for (const auto &kv : ptaMap) {
-    outs() << "  " << kv.first << " -> {";
-    for (const auto &pt : kv.second)
-      outs() << " " << pt;
-    outs() << " }\n";
-  }
+  outs() << "[PtaValidator] Loaded " << parsedPta.FactCount
+         << " PTA fact(s) from " << PtaFile << " in "
+         << (PtaMode == PtaModeKind::FS ? "FS" : "FI") << " mode\n";
 
   // 2. Load the LLVM IR
   LLVMContext Ctx;
@@ -547,7 +631,7 @@ int main(int argc, char **argv) {
   PB.registerModuleAnalyses(MAM);
 
   ModulePassManager MPM;
-  MPM.addPass(PtaValidatorPass(ptaMap, PtaFile));
+  MPM.addPass(PtaValidatorPass(parsedPta, PtaFile, PtaMode));
   MPM.run(*M, MAM);
 
   // 4. Verify the resulting IR

@@ -1,0 +1,2 @@
+# Deliberately uses a non-matching program point so the actual dereference has no FS fact.
+@main:entry:99 %p -> %a

@@ -14,7 +14,8 @@
  * Data structures (in-memory, C implementation):
  *
  *   Structure 1 (static, from pta file):
- *     A hash map:  pointer_name (string) -> list of pointee_names (strings)
+ *     FI mode: pointer_name -> list of pointee_names
+ *     FS mode: (program_point, pointer_name) -> list of pointee_names
  *
  *   Structure 2 (dynamic, updated at runtime):
  *     A hash map:  abstract_name (string) -> list of (base_addr, size) ranges
@@ -61,15 +62,30 @@ typedef struct PtaEntry {
   struct PtaEntry *next;
 } PtaEntry;
 
+typedef struct FsPtaEntry {
+  char program_point[MAX_NAME_LEN];
+  char ptr_name[MAX_NAME_LEN];
+  char pointees[MAX_POINTEES][MAX_NAME_LEN];
+  int num_pointees;
+  struct FsPtaEntry *next;
+} FsPtaEntry;
+
+typedef enum PtaMode {
+  PTA_MODE_FI = 0,
+  PTA_MODE_FS = 1,
+} PtaMode;
+
 // ---------------------------------------------------------------------------
 // Hash tables
 // ---------------------------------------------------------------------------
 
-static PtaEntry  *pta_table[HASH_TABLE_SIZE];   // Structure 1
+static PtaEntry  *pta_table[HASH_TABLE_SIZE];    // FI Structure 1
+static FsPtaEntry *fs_pta_table[HASH_TABLE_SIZE]; // FS Structure 1
 static AllocEntry *alloc_table[HASH_TABLE_SIZE]; // Structure 2
 
 static int runtime_initialized = 0;
 static unsigned long unsound_count = 0;
+static PtaMode active_mode = PTA_MODE_FI;
 
 static void report_validation_summary(void) {
   if (!runtime_initialized)
@@ -99,6 +115,16 @@ static unsigned int hash_str(const char *s) {
   return (unsigned int)(h & (HASH_TABLE_SIZE - 1));
 }
 
+static unsigned int hash_fs_key(const char *program_point, const char *ptr_name) {
+  unsigned long h = 5381u;
+  int c;
+  while ((c = *program_point++))
+    h = ((h << 5) + h) + (unsigned long)c;
+  while ((c = *ptr_name++))
+    h = ((h << 5) + h) + (unsigned long)c;
+  return (unsigned int)(h & (HASH_TABLE_SIZE - 1));
+}
+
 // ---------------------------------------------------------------------------
 // Structure 1 helpers
 // ---------------------------------------------------------------------------
@@ -121,6 +147,29 @@ static PtaEntry *pta_insert(const char *ptr_name) {
   strncpy(e->ptr_name, ptr_name, MAX_NAME_LEN - 1);
   e->next = pta_table[h];
   pta_table[h] = e;
+  return e;
+}
+
+static FsPtaEntry *fs_pta_find(const char *program_point, const char *ptr_name) {
+  unsigned int h = hash_fs_key(program_point, ptr_name);
+  FsPtaEntry *e = fs_pta_table[h];
+  while (e) {
+    if (strncmp(e->program_point, program_point, MAX_NAME_LEN) == 0 &&
+        strncmp(e->ptr_name, ptr_name, MAX_NAME_LEN) == 0)
+      return e;
+    e = e->next;
+  }
+  return NULL;
+}
+
+static FsPtaEntry *fs_pta_insert(const char *program_point, const char *ptr_name) {
+  unsigned int h = hash_fs_key(program_point, ptr_name);
+  FsPtaEntry *e = calloc(1, sizeof(FsPtaEntry));
+  if (!e) { perror("calloc"); exit(1); }
+  strncpy(e->program_point, program_point, MAX_NAME_LEN - 1);
+  strncpy(e->ptr_name, ptr_name, MAX_NAME_LEN - 1);
+  e->next = fs_pta_table[h];
+  fs_pta_table[h] = e;
   return e;
 }
 
@@ -164,13 +213,22 @@ static char *trim(char *s) {
   // ltrim
   while (*s == ' ' || *s == '\t') s++;
   // rtrim
+  if (*s == '\0')
+    return s;
   char *end = s + strlen(s) - 1;
-  while (end > s && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r'))
+  while (end >= s &&
+         (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r'))
     *end-- = '\0';
   return s;
 }
 
-static void parse_pta_file(const char *path) {
+static void strip_comment(char *line) {
+  char *comment = strchr(line, '#');
+  if (comment)
+    *comment = '\0';
+}
+
+static void parse_fi_pta_file(const char *path) {
   FILE *f = fopen(path, "r");
   if (!f) {
     fprintf(stderr, "[PtaRuntime] ERROR: cannot open points-to file: %s\n", path);
@@ -179,6 +237,7 @@ static void parse_pta_file(const char *path) {
 
   char line[4096];
   while (fgets(line, sizeof(line), f)) {
+    strip_comment(line);
     char *l = trim(line);
     if (l[0] == '\0' || l[0] == '#')
       continue;
@@ -197,6 +256,7 @@ static void parse_pta_file(const char *path) {
     // Find or create entry for the pointer
     PtaEntry *entry = pta_find(lhs);
     if (!entry) entry = pta_insert(lhs);
+    entry->num_pointees = 0;
 
     // Tokenize RHS by spaces
     char *tok = strtok(rhs, " \t");
@@ -216,6 +276,60 @@ static void parse_pta_file(const char *path) {
   fclose(f);
 }
 
+static void parse_fs_pta_file(const char *path) {
+  FILE *f = fopen(path, "r");
+  if (!f) {
+    fprintf(stderr, "[PtaRuntime] ERROR: cannot open points-to file: %s\n", path);
+    exit(1);
+  }
+
+  char line[4096];
+  while (fgets(line, sizeof(line), f)) {
+    strip_comment(line);
+    char *l = trim(line);
+    if (l[0] == '\0')
+      continue;
+
+    char *arrow = strstr(l, "->");
+    if (!arrow)
+      continue;
+
+    *arrow = '\0';
+    char *lhs = trim(l);
+    char *rhs = trim(arrow + 2);
+    if (lhs[0] != '@')
+      continue;
+
+    char *program_point_tok = strtok(lhs, " \t");
+    char *ptr_tok = strtok(NULL, " \t");
+    if (!program_point_tok || !ptr_tok || program_point_tok[0] != '@')
+      continue;
+    if (program_point_tok[1] == '\0')
+      continue;
+
+    const char *program_point = program_point_tok + 1;
+    FsPtaEntry *entry = fs_pta_find(program_point, ptr_tok);
+    if (!entry)
+      entry = fs_pta_insert(program_point, ptr_tok);
+    entry->num_pointees = 0;
+
+    char *tok = strtok(rhs, " \t");
+    while (tok) {
+      if (entry->num_pointees < MAX_POINTEES) {
+        strncpy(entry->pointees[entry->num_pointees], tok, MAX_NAME_LEN - 1);
+        entry->num_pointees++;
+      } else {
+        fprintf(stderr,
+                "[PtaRuntime] WARNING: too many FS pointees for '@%s %s', truncating.\n",
+                program_point, ptr_tok);
+      }
+      tok = strtok(NULL, " \t");
+    }
+  }
+
+  fclose(f);
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -224,15 +338,21 @@ static void parse_pta_file(const char *path) {
  * __pta_init — called once at program startup (via global constructor).
  * Reads the points-to file and populates Structure 1.
  */
-void __pta_init(const char *pta_file_path) {
+void __pta_init(const char *pta_file_path, uint64_t pta_mode) {
   if (runtime_initialized) return;
   memset(pta_table, 0, sizeof(pta_table));
+  memset(fs_pta_table, 0, sizeof(fs_pta_table));
   memset(alloc_table, 0, sizeof(alloc_table));
   unsound_count = 0;
-  parse_pta_file(pta_file_path);
+  active_mode = (pta_mode == PTA_MODE_FS) ? PTA_MODE_FS : PTA_MODE_FI;
+  if (active_mode == PTA_MODE_FS)
+    parse_fs_pta_file(pta_file_path);
+  else
+    parse_fi_pta_file(pta_file_path);
   runtime_initialized = 1;
   atexit(report_validation_summary);
-  fprintf(stderr, "[PtaRuntime] Initialized from: %s\n", pta_file_path);
+  fprintf(stderr, "[PtaRuntime] Initialized from: %s (mode=%s)\n",
+          pta_file_path, active_mode == PTA_MODE_FS ? "fs" : "fi");
 }
 
 /**
@@ -304,53 +424,44 @@ void __pta_record_free(void *ptr) {
  *
  * @param ptr_var_name  The IR-level name of the pointer variable (e.g. "%p")
  * @param addr          The runtime address being dereferenced
+ * @param program_point The IR-derived key "function:block:instruction_index"
  */
-void __pta_check_deref(const char *ptr_var_name, void *addr) {
-  if (!runtime_initialized) return;
-
-  // Look up the pointer in Structure 1
-  PtaEntry *pta = pta_find(ptr_var_name);
-  if (!pta) {
-    // Not in the points-to map at all — skip (conservative: don't flag)
-    return;
-  }
-
+static int validate_against_pointees(const char *ptr_var_name,
+                                     const char pointees[MAX_POINTEES][MAX_NAME_LEN],
+                                     int num_pointees, void *addr) {
   uintptr_t deref_addr = (uintptr_t)addr;
 
-  // For each pointee in the points-to set, check if deref_addr falls
-  // within any of its live allocation ranges
-  for (int i = 0; i < pta->num_pointees; i++) {
-    const char *pointee_name = pta->pointees[i];
+  for (int i = 0; i < num_pointees; i++) {
+    const char *pointee_name = pointees[i];
     AllocEntry *ae = alloc_find(pointee_name);
 
-    if (!ae) {
-      // No allocation recorded for this pointee yet — this could mean
-      // the pointee is a global not yet recorded, or a bug.
-      // We treat this as "no range available" and continue checking others.
+    if (!ae)
       continue;
-    }
 
     for (int j = 0; j < ae->num_ranges; j++) {
       uintptr_t base = ae->ranges[j].base;
-      size_t    size = ae->ranges[j].size;
-      if (deref_addr >= base && deref_addr < base + size) {
-        // VALID: address falls within a known pointee's allocation
-        return;
-      }
+      size_t size = ae->ranges[j].size;
+      if (deref_addr >= base && deref_addr < base + size)
+        return 1;
     }
   }
 
-  // None of the pointee ranges covered this address — UNSOUND!
+  return 0;
+}
+
+static void report_unsound(const char *ptr_var_name, void *addr,
+                           const char *program_point,
+                           const char *reason,
+                           const char pointees[MAX_POINTEES][MAX_NAME_LEN],
+                           int num_pointees) {
   unsound_count++;
   fprintf(stderr,
-          "[PtaRuntime] UNSOUND: pointer '%s' dereferenced address %p, "
-          "which is not within any expected pointee allocation.\n"
-          "             Expected pointees: { ",
-          ptr_var_name, addr);
-
-  for (int i = 0; i < pta->num_pointees; i++) {
-    fprintf(stderr, "%s ", pta->pointees[i]);
-    AllocEntry *ae = alloc_find(pta->pointees[i]);
+          "[PtaRuntime] UNSOUND: pointer '%s' at program point '@%s' dereferenced address %p (%s).\n",
+          ptr_var_name, program_point, addr, reason);
+  fprintf(stderr, "             Expected pointees: { ");
+  for (int i = 0; i < num_pointees; i++) {
+    fprintf(stderr, "%s ", pointees[i]);
+    AllocEntry *ae = alloc_find(pointees[i]);
     if (ae && ae->num_ranges > 0) {
       fprintf(stderr, "[");
       for (int j = 0; j < ae->num_ranges; j++) {
@@ -364,9 +475,43 @@ void __pta_check_deref(const char *ptr_var_name, void *addr) {
     }
   }
   fprintf(stderr, "}\n");
+}
 
-  // Exit with failure to clearly signal unsoundness
-  // (change to a counter increment if you want to collect all violations)
-  // E: I'm commenting it out bcz I want to see all violations, not just the first one.
-  // exit(1);
+void __pta_check_deref(const char *ptr_var_name, void *addr,
+                       const char *program_point) {
+  if (!runtime_initialized) return;
+
+  if (active_mode == PTA_MODE_FS) {
+    FsPtaEntry *pta = fs_pta_find(program_point, ptr_var_name);
+    if (!pta) {
+      report_unsound(ptr_var_name, addr, program_point,
+                     "no flow-sensitive points-to fact", NULL, 0);
+      return;
+    }
+    if (pta->num_pointees == 0) {
+      report_unsound(ptr_var_name, addr, program_point,
+                     "empty flow-sensitive points-to set",
+                     pta->pointees, pta->num_pointees);
+      return;
+    }
+    if (validate_against_pointees(ptr_var_name, pta->pointees, pta->num_pointees,
+                                  addr))
+      return;
+
+    report_unsound(ptr_var_name, addr, program_point,
+                   "address is not within any expected pointee allocation",
+                   pta->pointees, pta->num_pointees);
+    return;
+  }
+
+  PtaEntry *pta = pta_find(ptr_var_name);
+  if (!pta)
+    return;
+  if (validate_against_pointees(ptr_var_name, pta->pointees, pta->num_pointees,
+                                addr))
+    return;
+
+  report_unsound(ptr_var_name, addr, program_point,
+                 "address is not within any expected pointee allocation",
+                 pta->pointees, pta->num_pointees);
 }

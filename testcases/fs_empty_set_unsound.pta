@@ -1,0 +1,2 @@
+# Empty FS pointee set must be treated as UNSOUND.
+@main:entry:9 %p ->

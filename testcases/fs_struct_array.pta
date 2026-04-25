@@ -1,0 +1,3 @@
+# Both dereferences access fields within the same array allocation.
+@main:entry:11 %p -> %arr
+@main:entry:15 %p -> %arr
