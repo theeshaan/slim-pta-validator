@@ -1,6 +1,6 @@
 # A Points-To Analysis Validator for LLVM IR
 
-This project instruments LLVM IR and validates points-to analysis facts at run time.
+This project implements a system that validates points-to analysis for C programs by instrumenting LLVM IR. It inserts runtime checks that compare actual pointer dereferences against statically computed points-to sets, reporting any mismatches encountered during execution.
 
 ## Build
 
@@ -89,10 +89,13 @@ The validator prints a summary to `stderr`:
 #### LLVM version
 It is preferred to use LLVM-18 as the scripts assume LLVM-18, and testing has been done for LLVM-18. That said, if you are unable to use LLVM-18, then LLVM-17+ should work. Change the `clang` invocations in `validate.sh` and `util/compile.sh` according to the version of LLVM you are using.
 
-#### `.ll` files as input
-If you are providing `.ll` files instead of `.c` files, please take care that the validator expects unoptimized IR with debug info and preserved value names:
+#### IR files as input
+If you are providing a `.ll` file instead of a `.c` file, please take care that the validator expects unoptimized IR with debug info and preserved value names:
 
 - `-O0`
 - `-g`
 - `-fno-discard-value-names`
 
+---
+
+Please let me know if you find any issues. Happy usage!
