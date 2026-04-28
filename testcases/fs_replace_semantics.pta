@@ -1,4 +1,3 @@
 # Program points use @<function>:<basic-block>:<instruction-index>.
-# The second dereference is intentionally unsound if FS facts replace earlier ones.
-@main:entry:12 %p -> %a %b
-@main:entry:15 %p -> %a
+@main:entry:12 %p -> %a
+@main:entry:15 %p -> 

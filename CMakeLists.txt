@@ -62,6 +62,7 @@ add_custom_target(usage
   COMMAND ${CMAKE_COMMAND} -E echo "Step 1: Instrument the IR"
   COMMAND ${CMAKE_COMMAND} -E echo "  ./pta-validator input.ll points-to.txt -o instrumented.ll"
   COMMAND ${CMAKE_COMMAND} -E echo "  ./pta-validator --pta-mode=fs input.ll points-to.txt -o instrumented.ll"
+  COMMAND ${CMAKE_COMMAND} -E echo "  ./pta-validator --pta-mode=fs --program-point-format=source-line input.ll points-to.txt -o instrumented.ll"
   COMMAND ${CMAKE_COMMAND} -E echo ""
   COMMAND ${CMAKE_COMMAND} -E echo "Step 2: Compile + link instrumented IR with the runtime"
   COMMAND ${CMAKE_COMMAND} -E echo "  clang-18 instrumented.ll libpta_runtime.a -o program_instrumented"

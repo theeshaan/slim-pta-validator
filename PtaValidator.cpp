@@ -62,11 +62,25 @@ enum class PtaModeKind {
   FS = 1,
 };
 
+enum class ProgramPointFormatKind {
+  IR = 0,
+  SourceLine = 1,
+};
+
 static cl::opt<PtaModeKind> PtaMode(
     "pta-mode", cl::desc("Select PTA validation mode"),
     cl::values(clEnumValN(PtaModeKind::FI, "fi", "Flow-insensitive PTA"),
                clEnumValN(PtaModeKind::FS, "fs", "Flow-sensitive PTA")),
     cl::init(PtaModeKind::FI));
+
+static cl::opt<ProgramPointFormatKind> ProgramPointFormat(
+    "program-point-format", cl::desc("Select FS program-point format"),
+    cl::values(
+        clEnumValN(ProgramPointFormatKind::IR, "ir",
+                   "Use @<function>:<basic-block>:<instruction-index>"),
+        clEnumValN(ProgramPointFormatKind::SourceLine, "source-line",
+                   "Use @<source-line-number> from debug info")),
+    cl::init(ProgramPointFormatKind::IR));
 
 // ---------------------------------------------------------------------------
 // Points-to file parser
@@ -180,11 +194,17 @@ static ParsedPtaData parsePtaFile(const std::string &path, PtaModeKind mode) {
 // These functions are defined in runtime.c and linked with the instrumented
 // program. We declare them here so IRBuilder can emit calls to them.
 //
-//   void __pta_init(const char *pta_file_path, uint64_t pta_mode);
+//   void __pta_init(const char *pta_file_path, uint64_t pta_mode,
+//                   uint64_t program_point_format);
+//   void __pta_register_program_point(const char *program_point,
+//                                     uint64_t ordinal);
 //   void __pta_record_alloc(const char *abstract_name, void *ptr, size_t size);
 //   void __pta_record_free(void *ptr);
+//   void __pta_mark_ptr_initialized(void *slot_addr);
 //   void __pta_check_deref(const char *ptr_var_name, void *addr,
-//                          const char *program_point);
+//                          const char *program_point,
+//                          uint64_t program_point_ordinal,
+//                          void *ptr_source_addr);
 // ---------------------------------------------------------------------------
 
 static FunctionCallee getOrDeclareFunc(Module &M, const std::string &name,
@@ -193,10 +213,12 @@ static FunctionCallee getOrDeclareFunc(Module &M, const std::string &name,
 }
 
 struct RuntimeFuncs {
-  FunctionCallee PtaInit;        // __pta_init(const char*, uint64_t)
+  FunctionCallee PtaInit;        // __pta_init(const char*, uint64_t, uint64_t)
+  FunctionCallee RegisterProgramPoint; // __pta_register_program_point(const char*, uint64_t)
   FunctionCallee RecordAlloc;    // __pta_record_alloc(const char*, void*, size_t)
   FunctionCallee RecordFree;     // __pta_record_free(void*)
-  FunctionCallee CheckDeref;     // __pta_check_deref(const char*, void*, const char*)
+  FunctionCallee MarkPtrInitialized; // __pta_mark_ptr_initialized(void*)
+  FunctionCallee CheckDeref;     // __pta_check_deref(const char*, void*, const char*, uint64_t, void*)
 };
 
 static RuntimeFuncs declareRuntimeFunctions(Module &M, LLVMContext &Ctx) {
@@ -208,6 +230,10 @@ static RuntimeFuncs declareRuntimeFunctions(Module &M, LLVMContext &Ctx) {
 
   RF.PtaInit = getOrDeclareFunc(
       M, "__pta_init",
+      FunctionType::get(VoidTy, {I8PtrTy, SizeTy, SizeTy}, false));
+
+  RF.RegisterProgramPoint = getOrDeclareFunc(
+      M, "__pta_register_program_point",
       FunctionType::get(VoidTy, {I8PtrTy, SizeTy}, false));
 
   RF.RecordAlloc = getOrDeclareFunc(
@@ -218,9 +244,14 @@ static RuntimeFuncs declareRuntimeFunctions(Module &M, LLVMContext &Ctx) {
       M, "__pta_record_free",
       FunctionType::get(VoidTy, {I8PtrTy}, false));
 
+  RF.MarkPtrInitialized = getOrDeclareFunc(
+      M, "__pta_mark_ptr_initialized",
+      FunctionType::get(VoidTy, {I8PtrTy}, false));
+
   RF.CheckDeref = getOrDeclareFunc(
       M, "__pta_check_deref",
-      FunctionType::get(VoidTy, {I8PtrTy, I8PtrTy, I8PtrTy}, false));
+      FunctionType::get(VoidTy, {I8PtrTy, I8PtrTy, I8PtrTy, SizeTy, I8PtrTy},
+                        false));
 
   return RF;
 }
@@ -253,9 +284,10 @@ static Value *makeStringPtr(IRBuilder<> &B, Module &M, const std::string &s) {
 class PtaValidatorPass : public PassInfoMixin<PtaValidatorPass> {
 public:
   PtaValidatorPass(ParsedPtaData parsedPta, std::string ptaFilePath,
-                   PtaModeKind ptaMode)
+                   PtaModeKind ptaMode,
+                   ProgramPointFormatKind programPointFormat)
       : ParsedPta_(std::move(parsedPta)), PtaFilePath_(std::move(ptaFilePath)),
-        PtaMode_(ptaMode) {}
+        PtaMode_(ptaMode), ProgramPointFormat_(programPointFormat) {}
 
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
     LLVMContext &Ctx = M.getContext();
@@ -285,6 +317,9 @@ public:
       instrumentFunction(F, M, B, Ctx, DL, RF);
     }
 
+    injectProgramPointRegistrations(M, B, Ctx, RF);
+    finalizeCtorFunction(Ctx);
+
     return PreservedAnalyses::none();
   }
 
@@ -292,15 +327,19 @@ private:
   struct DerefSite {
     Instruction *Inst;
     std::string ProgramPoint;
+    std::uint64_t ProgramPointOrdinal;
   };
 
   ParsedPtaData ParsedPta_;
   std::string PtaFilePath_;
   PtaModeKind PtaMode_;
+  ProgramPointFormatKind ProgramPointFormat_;
 
   // The global constructor function we inject; created once, reused for globals
   Function *CtorFn_ = nullptr;
   BasicBlock *CtorBB_ = nullptr;
+  std::uint64_t NextProgramPointOrdinal_ = 0;
+  std::vector<std::pair<std::string, std::uint64_t>> RegisteredProgramPoints_;
 
   // ----------------------------------------------------------------
   // Create (or return) the module constructor function
@@ -324,7 +363,7 @@ private:
   }
 
   // ----------------------------------------------------------------
-  // 1. Inject __pta_init(pta_file_path) into the constructor
+  // 1. Inject __pta_init(pta_file_path, mode, program_point_format) into the constructor
   // ----------------------------------------------------------------
   void injectInitCall(Module &M, IRBuilder<> &B, LLVMContext &Ctx,
                        RuntimeFuncs &RF) {
@@ -335,7 +374,10 @@ private:
     Value *PathStr = B.CreateGlobalStringPtr(PtaFilePath_, "__pta_filepath");
     Value *ModeValue =
         ConstantInt::get(Type::getInt64Ty(Ctx), static_cast<std::uint64_t>(PtaMode_));
-    B.CreateCall(RF.PtaInit, {PathStr, ModeValue});
+    Value *ProgramPointFormatValue = ConstantInt::get(
+        Type::getInt64Ty(Ctx),
+        static_cast<std::uint64_t>(ProgramPointFormat_));
+    B.CreateCall(RF.PtaInit, {PathStr, ModeValue, ProgramPointFormatValue});
 
     // Register this function as a global constructor (priority 0)
     appendToGlobalCtors(M, CtorFn_, 0);
@@ -356,6 +398,11 @@ private:
 
       std::string name = getValueName(&GV);
 
+      if (GV.getValueType()->isPointerTy()) {
+        Value *PtrSlot = B.CreateBitCast(&GV, PointerType::getUnqual(Ctx));
+        B.CreateCall(RF.MarkPtrInitialized, {PtrSlot});
+      }
+
       // Only instrument if this global appears in the points-to map
       // as a pointee (i.e. some pointer may point to it)
       if (!isKnownPointee(name))
@@ -368,8 +415,6 @@ private:
       B.CreateCall(RF.RecordAlloc, {NameStr, Ptr, Size});
     }
 
-    // Finalize ctor with ret void
-    finalizeCtorFunction(Ctx);
   }
 
   // ----------------------------------------------------------------
@@ -381,6 +426,7 @@ private:
     // Collect instructions first to avoid iterator invalidation
     std::vector<AllocaInst *> Allocas;
     std::vector<CallInst *> Calls;
+    std::vector<StoreInst *> PointerStores;
     std::vector<DerefSite> Derefs;
     unsigned BasicBlockIndex = 0;
 
@@ -392,15 +438,27 @@ private:
           Allocas.push_back(AI);
         else if (auto *CI = dyn_cast<CallInst>(&I))
           Calls.push_back(CI);
-        else if (isa<LoadInst>(I) || isa<StoreInst>(I))
+        else if (auto *SI = dyn_cast<StoreInst>(&I)) {
+          if (SI->getValueOperand()->getType()->isPointerTy())
+            PointerStores.push_back(SI);
+          std::string ProgramPoint =
+              buildProgramPointKey(F, I, BlockKey, InstIndex);
           Derefs.push_back(
-              {&I, buildProgramPointKey(F, BlockKey, InstIndex)});
+              {&I, ProgramPoint, registerProgramPoint(ProgramPoint)});
+        } else if (isa<LoadInst>(I))
+          {
+            std::string ProgramPoint =
+                buildProgramPointKey(F, I, BlockKey, InstIndex);
+            Derefs.push_back(
+                {&I, ProgramPoint, registerProgramPoint(ProgramPoint)});
+          }
         InstIndex++;
       }
     }
 
     instrumentAllocas(Allocas, M, B, Ctx, DL, RF);
     instrumentCalls(Calls, M, B, Ctx, RF);
+    instrumentPointerStores(PointerStores, B, Ctx, RF);
     instrumentDerefs(Derefs, M, B, Ctx, RF);
   }
 
@@ -490,6 +548,16 @@ private:
     }
   }
 
+  void instrumentPointerStores(std::vector<StoreInst *> &Stores, IRBuilder<> &B,
+                               LLVMContext &Ctx, RuntimeFuncs &RF) {
+    for (StoreInst *SI : Stores) {
+      B.SetInsertPoint(SI->getNextNode());
+      Value *SlotAddr =
+          B.CreateBitCast(SI->getPointerOperand(), PointerType::getUnqual(Ctx));
+      B.CreateCall(RF.MarkPtrInitialized, {SlotAddr});
+    }
+  }
+
   // ----------------------------------------------------------------
   // 3c. Instrument loads and stores
   //     Before each load/store, call
@@ -515,7 +583,28 @@ private:
       B.SetInsertPoint(I);
       Value *NameStr = makeStringPtr(B, M, *PtrName);
       Value *ProgramPointStr = makeStringPtr(B, M, Site.ProgramPoint);
-      B.CreateCall(RF.CheckDeref, {NameStr, PtrOp, ProgramPointStr});
+      Value *ProgramPointOrdinal =
+          ConstantInt::get(Type::getInt64Ty(Ctx), Site.ProgramPointOrdinal);
+      Value *PtrSourceAddr = ConstantPointerNull::get(PointerType::getUnqual(Ctx));
+      if (Value *InitSource = inferPointerInitSourceForDeref(PtrOp))
+        PtrSourceAddr =
+            B.CreateBitCast(InitSource, PointerType::getUnqual(Ctx));
+      B.CreateCall(RF.CheckDeref,
+                   {NameStr, PtrOp, ProgramPointStr, ProgramPointOrdinal,
+                    PtrSourceAddr});
+    }
+  }
+
+  void injectProgramPointRegistrations(Module &M, IRBuilder<> &B,
+                                       LLVMContext &Ctx, RuntimeFuncs &RF) {
+    if (ProgramPointFormat_ != ProgramPointFormatKind::IR)
+      return;
+
+    B.SetInsertPoint(CtorBB_);
+    for (const auto &Entry : RegisteredProgramPoints_) {
+      Value *ProgramPointStr = B.CreateGlobalStringPtr(Entry.first);
+      Value *Ordinal = ConstantInt::get(Type::getInt64Ty(Ctx), Entry.second);
+      B.CreateCall(RF.RegisterProgramPoint, {ProgramPointStr, Ordinal});
     }
   }
 
@@ -526,10 +615,24 @@ private:
     return "bb" + std::to_string(BasicBlockIndex);
   }
 
-  std::string buildProgramPointKey(const Function &F,
+  std::string buildProgramPointKey(const Function &F, const Instruction &I,
                                    const std::string &BlockKey,
                                    unsigned InstIndex) const {
+    if (ProgramPointFormat_ == ProgramPointFormatKind::SourceLine) {
+      const DebugLoc &DbgLoc = I.getDebugLoc();
+      if (DbgLoc && DbgLoc.getLine() != 0)
+        return std::to_string(DbgLoc.getLine());
+    }
     return F.getName().str() + ":" + BlockKey + ":" + std::to_string(InstIndex);
+  }
+
+  std::uint64_t registerProgramPoint(const std::string &ProgramPoint) {
+    if (ProgramPointFormat_ != ProgramPointFormatKind::IR)
+      return 0;
+
+    std::uint64_t Ordinal = NextProgramPointOrdinal_++;
+    RegisteredProgramPoints_.push_back({ProgramPoint, Ordinal});
+    return Ordinal;
   }
 
   // Infer the abstract pointer variable name that should be used for a
@@ -579,6 +682,28 @@ private:
     }
 
     return std::nullopt;
+  }
+
+  Value *inferPointerInitSourceForDeref(Value *DerefAddr) const {
+    return inferPointerInitSourceForDeref(DerefAddr, 0);
+  }
+
+  Value *inferPointerInitSourceForDeref(Value *DerefAddr, unsigned Depth) const {
+    if (Depth > 8)
+      return nullptr;
+
+    Value *V = DerefAddr->stripPointerCasts();
+
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(V))
+      return inferPointerInitSourceForDeref(GEP->getPointerOperand(), Depth + 1);
+
+    if (auto *LI = dyn_cast<LoadInst>(V)) {
+      if (LI->getType()->isPointerTy())
+        return LI->getPointerOperand()->stripPointerCasts();
+      return nullptr;
+    }
+
+    return nullptr;
   }
 
   // ----------------------------------------------------------------
@@ -631,7 +756,8 @@ int main(int argc, char **argv) {
   PB.registerModuleAnalyses(MAM);
 
   ModulePassManager MPM;
-  MPM.addPass(PtaValidatorPass(parsedPta, PtaFile, PtaMode));
+  MPM.addPass(
+      PtaValidatorPass(parsedPta, PtaFile, PtaMode, ProgramPointFormat));
   MPM.run(*M, MAM);
 
   // 4. Verify the resulting IR

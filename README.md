@@ -1,84 +1,33 @@
 # A Points-To Analysis Validator for LLVM IR
 
 This project instruments LLVM IR and validates points-to analysis facts at run time.
-It supports both flow-insensitive (FI) and flow-sensitive (FS) validation.
 
 ## Build
 
+LLVM-18 is required. (see notes at end)
 ```bash
 cmake -S . -B build -DLLVM_DIR=$(llvm-config-18 --cmakedir)
 cmake --build build -j
 ```
 
-LLVM 17+ is required.
+## Usage
 
-## Compile input IR
+The validator takes a C program (or LLVM `.ll` IR of a C program) and a file containing pointer analysis facts. It then instruments the IR to validate the pta facts at runtime.
 
-Generate LLVM IR:
-
-```bash
-clang -O0 -S -emit-llvm -g -fno-discard-value-names \
-  -o input.ll input.c
-```
-
-The validator expects unoptimized IR with debug info and preserved value names:
-
-- `-O0`
-- `-g`
-- `-fno-discard-value-names`
-
-## Instrumentation usage
-
-FI mode is the default:
-
-```bash
-./build/pta-validator input.ll points_to.pta -o instrumented.ll
-```
-
-
-FS mode is selected explicitly:
-
-```bash
-./build/pta-validator --pta-mode=fs input.ll points_to.pta -o instrumented.ll
-```
-
-Then link the instrumented IR with the runtime, and run the instrumented program:
-
-```bash
-clang instrumented.ll build/libpta_runtime.a -o program_instrumented
-./program_instrumented
-```
-
-The runtime prints a summary to `stderr`:
-
-- `SUCCESS` when no unsound dereference was observed
-- `FAILURE` when one or more unsound dereferences were observed
-
-## FI points-to file format
-
-Use one entry per pointer variable:
-
-```text
+### Points-to file structure
+#### Flow-insensitive (FI) points-to information
+If you wish to validate a FI pointer analysis, structure the pta file as follows:
+ ```text
 # <pointer_var> -> <pointee1> <pointee2> ...
 %p -> %x %y
 %q -> %z
 @gptr -> @gx
-```
+ ```
 
-Notes:
+#### Flow-sensitive (FS) points-to information
+There are two supported formats for flow-sensitive pta files:
 
-- Names must exactly match LLVM IR names (use `%` for locals, `@` for globals).
-- Lines starting with `#` are treated as comments and ignored.
-- Empty RHS is valid and is treated as an empty pointee set:
-
-```text
-%p ->
-```
-
-## FS points-to file format
-
-Each fact is attached to an IR-derived program point:
-
+1. Based on IR-derived program points
 ```text
 # @<function>:<basic-block>:<instruction-index> <ptr_name> -> <pointee1> ...
 @main:entry:12 %p -> %a %b
@@ -86,48 +35,64 @@ Each fact is attached to an IR-derived program point:
 @main:entry:18 %p ->
 ```
 
-FS semantics:
-
-- Facts are keyed by exact `(@program_point, ptr_name)`.
-- If the same key appears multiple times, the last entry in file order wins.
-- Empty RHS means the active points-to set is empty.
-- Missing or empty FS facts at a dereference are treated as `UNSOUND`.
-- FS mode uses only the FS file provided for that run. There is no FI fallback.
-
 Program-point components:
 
 - `function`: LLVM function name
 - `basic-block`: LLVM basic block label, or `bb<N>` when the block is unnamed
 - `instruction-index`: 0-based index of the dereference instruction within that basic block, counting all instructions in block order
 
-The validator derives the same key directly from the input LLVM IR. To inspect
-the exact keys used for instrumented checks, look for calls to
-`__pta_check_deref(..., ptr @<program-point-string>)` in the emitted `.ll`
-file, or inspect the associated constant strings.
-
-## Example commands
-
-FI example:
-
-```bash
-clang -O0 -S -emit-llvm -g -fno-discard-value-names \
-  -o build/branching_deref.ll testcases/branching_deref.c
-./build/pta-validator build/branching_deref.ll testcases/branching_deref.pta \
-  -o build/branching_deref.inst.ll
-clang build/branching_deref.inst.ll build/libpta_runtime.a \
-  -o build/branching_deref.bin
-./build/branching_deref.bin
+2. Based on source-code based line numbers
+```text
+# @<line_number> <ptr_name> -> <pointee1> <pointee2> ...
+@6 %p -> %a %b
+@15 %p -> %b
+@22 %p ->
 ```
 
-FS example:
+#### PTA notes
+- Names must exactly match LLVM IR names (use % for locals, @ for globals).
+- Lines starting with # are treated as comments and ignored.
+- Empty RHS is valid and is treated as an empty pointee set.
+- Facts are keyed by exact `(@program_point, ptr_name)`.
+- (FS) If the same key appears multiple times, the last entry in file order wins.
+- Missing or empty facts at a dereference are treated as `UNSOUND`.
+- A fact becomes active at its program point and remains active for later
+  dereferences of the same pointer until another fact for that pointer
+  overwrites it.
+- If the same key appears multiple times, the last entry in file order wins.
+- Only dereferences of pointers that have an entry in the pta file are tracked (even empty entry: %p ->).
+- If a dereferenced pointer value comes from a pointer slot that was never
+initialized at runtime, the runtime prints an `UNSOUND` diagnostic stating that
+an uninitialized dereference was encountered before continuing to the actual
+dereference instruction.
+
+
+### Running the validator
+You can run the validator using the script `validate.sh`. Apart from the program (C/IR) file and the pta file, it takes two command-line options:
+
+- `--pta-mode=fi|fs`: "fs" for flow-sensitive and "fi" for flow-insensitive. FI mode is default.
+- `--program-point-format=ir|source-line`: "ir" is for FS analysis with IR-derived program points, "source-line" is for source line number based program points. Default is IR-based.
+
+Run the validator using:
 
 ```bash
-clang -O0 -S -emit-llvm -g -fno-discard-value-names \
-  -o build/fs_last_entry_wins.ll testcases/fs_last_entry_wins.c
-./build/pta-validator --pta-mode=fs \
-  build/fs_last_entry_wins.ll testcases/fs_last_entry_wins.pta \
-  -o build/fs_last_entry_wins.inst.ll
-clang build/fs_last_entry_wins.inst.ll build/libpta_runtime.a \
-  -o build/fs_last_entry_wins.bin
-./build/fs_last_entry_wins.bin
+./validate.sh [--pta-mode=fi|fs] [--program-point-format=ir|source-line] <input.c|input.ll> <pta_file>
 ```
+This command compiles the program (if C file), instruments the LLVM IR with points-to facts from the pta file and asserts to check dereferences, and then compiles and runs the instrumented IR. Finally, it deletes all files generated by the script.
+
+The validator prints a summary to `stderr`:
+
+- `SUCCESS` when no unsound dereference was observed
+- `FAILURE` when one or more unsound dereferences were observed
+
+## Notes
+#### LLVM version
+It is preferred to use LLVM-18 as the scripts assume LLVM-18, and testing has been done for LLVM-18. That said, if you are unable to use LLVM-18, then LLVM-17+ should work. Change the `clang` invocations in `validate.sh` and `util/compile.sh` according to the version of LLVM you are using.
+
+#### `.ll` files as input
+If you are providing `.ll` files instead of `.c` files, please take care that the validator expects unoptimized IR with debug info and preserved value names:
+
+- `-O0`
+- `-g`
+- `-fno-discard-value-names`
+

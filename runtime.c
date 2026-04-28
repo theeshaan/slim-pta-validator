@@ -8,7 +8,8 @@
  *   1. __pta_init         — parse the points-to file, build Structure 1
  *   2. __pta_record_alloc — populate Structure 2 (abstract name -> live allocations)
  *   3. __pta_record_free  — remove an allocation from Structure 2
- *   4. __pta_check_deref  — at each pointer dereference, validate against
+ *   4. __pta_mark_ptr_initialized — record initialized pointer-storage slots
+ *   5. __pta_check_deref  — at each pointer dereference, validate against
  *                           the points-to map and live allocation ranges
  *
  * Data structures (in-memory, C implementation):
@@ -27,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <limits.h>
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -70,10 +72,26 @@ typedef struct FsPtaEntry {
   struct FsPtaEntry *next;
 } FsPtaEntry;
 
+typedef struct PtrInitEntry {
+  uintptr_t addr;
+  struct PtrInitEntry *next;
+} PtrInitEntry;
+
+typedef struct ProgramPointOrderEntry {
+  char program_point[MAX_NAME_LEN];
+  uint64_t ordinal;
+  struct ProgramPointOrderEntry *next;
+} ProgramPointOrderEntry;
+
 typedef enum PtaMode {
   PTA_MODE_FI = 0,
   PTA_MODE_FS = 1,
 } PtaMode;
+
+typedef enum ProgramPointFormat {
+  PROGRAM_POINT_IR = 0,
+  PROGRAM_POINT_SOURCE_LINE = 1,
+} ProgramPointFormat;
 
 // ---------------------------------------------------------------------------
 // Hash tables
@@ -82,10 +100,13 @@ typedef enum PtaMode {
 static PtaEntry  *pta_table[HASH_TABLE_SIZE];    // FI Structure 1
 static FsPtaEntry *fs_pta_table[HASH_TABLE_SIZE]; // FS Structure 1
 static AllocEntry *alloc_table[HASH_TABLE_SIZE]; // Structure 2
+static PtrInitEntry *ptr_init_table[HASH_TABLE_SIZE]; // Initialized pointer slots
+static ProgramPointOrderEntry *program_point_order_table[HASH_TABLE_SIZE];
 
 static int runtime_initialized = 0;
 static unsigned long unsound_count = 0;
 static PtaMode active_mode = PTA_MODE_FI;
+static ProgramPointFormat active_program_point_format = PROGRAM_POINT_IR;
 
 static void report_validation_summary(void) {
   if (!runtime_initialized)
@@ -125,6 +146,13 @@ static unsigned int hash_fs_key(const char *program_point, const char *ptr_name)
   return (unsigned int)(h & (HASH_TABLE_SIZE - 1));
 }
 
+static unsigned int hash_addr(uintptr_t addr) {
+  addr ^= addr >> 33;
+  addr *= 0xff51afd7ed558ccdULL;
+  addr ^= addr >> 33;
+  return (unsigned int)(addr & (HASH_TABLE_SIZE - 1));
+}
+
 // ---------------------------------------------------------------------------
 // Structure 1 helpers
 // ---------------------------------------------------------------------------
@@ -160,6 +188,87 @@ static FsPtaEntry *fs_pta_find(const char *program_point, const char *ptr_name) 
     e = e->next;
   }
   return NULL;
+}
+
+static ProgramPointOrderEntry *program_point_order_find(const char *program_point) {
+  unsigned int h = hash_str(program_point);
+  ProgramPointOrderEntry *e = program_point_order_table[h];
+  while (e) {
+    if (strncmp(e->program_point, program_point, MAX_NAME_LEN) == 0)
+      return e;
+    e = e->next;
+  }
+  return NULL;
+}
+
+static int parse_source_line_number(const char *program_point) {
+  char *end;
+  long value;
+
+  if (!program_point || program_point[0] == '\0')
+    return -1;
+
+  value = strtol(program_point, &end, 10);
+  if (*end != '\0' || value < 0 || value > INT32_MAX)
+    return -1;
+
+  return (int)value;
+}
+
+static FsPtaEntry *fs_pta_find_latest_source_line(const char *program_point,
+                                                  const char *ptr_name) {
+  int current_line = parse_source_line_number(program_point);
+  FsPtaEntry *best = NULL;
+  int best_line = -1;
+
+  if (current_line < 0)
+    return NULL;
+
+  for (int i = 0; i < HASH_TABLE_SIZE; i++) {
+    for (FsPtaEntry *e = fs_pta_table[i]; e; e = e->next) {
+      int fact_line;
+
+      if (strncmp(e->ptr_name, ptr_name, MAX_NAME_LEN) != 0)
+        continue;
+
+      fact_line = parse_source_line_number(e->program_point);
+      if (fact_line < 0 || fact_line > current_line)
+        continue;
+
+      if (!best || fact_line > best_line) {
+        best = e;
+        best_line = fact_line;
+      }
+    }
+  }
+
+  return best;
+}
+
+static FsPtaEntry *fs_pta_find_latest_ir(const char *ptr_name,
+                                         uint64_t current_ordinal) {
+  FsPtaEntry *best = NULL;
+  uint64_t best_ordinal = 0;
+
+  for (int i = 0; i < HASH_TABLE_SIZE; i++) {
+    for (FsPtaEntry *e = fs_pta_table[i]; e; e = e->next) {
+      ProgramPointOrderEntry *order_entry;
+
+      if (strncmp(e->ptr_name, ptr_name, MAX_NAME_LEN) != 0)
+        continue;
+
+      order_entry = program_point_order_find(e->program_point);
+      if (!order_entry || order_entry->ordinal > current_ordinal)
+        continue;
+
+      if (!best || order_entry->ordinal > best_ordinal) {
+        best = e;
+        best_ordinal = order_entry->ordinal;
+      }
+    }
+  }
+
+  return best;
 }
 
 static FsPtaEntry *fs_pta_insert(const char *program_point, const char *ptr_name) {
@@ -198,6 +307,26 @@ static AllocEntry *alloc_find_or_create(const char *name) {
   e->next = alloc_table[h];
   alloc_table[h] = e;
   return e;
+}
+
+static int ptr_init_contains(uintptr_t addr) {
+  unsigned int h = hash_addr(addr);
+  PtrInitEntry *e = ptr_init_table[h];
+  while (e) {
+    if (e->addr == addr)
+      return 1;
+    e = e->next;
+  }
+  return 0;
+}
+
+static void ptr_init_insert(uintptr_t addr) {
+  unsigned int h = hash_addr(addr);
+  PtrInitEntry *e = calloc(1, sizeof(PtrInitEntry));
+  if (!e) { perror("calloc"); exit(1); }
+  e->addr = addr;
+  e->next = ptr_init_table[h];
+  ptr_init_table[h] = e;
 }
 
 // ---------------------------------------------------------------------------
@@ -338,21 +467,66 @@ static void parse_fs_pta_file(const char *path) {
  * __pta_init — called once at program startup (via global constructor).
  * Reads the points-to file and populates Structure 1.
  */
-void __pta_init(const char *pta_file_path, uint64_t pta_mode) {
+void __pta_init(const char *pta_file_path, uint64_t pta_mode,
+                uint64_t program_point_format) {
   if (runtime_initialized) return;
   memset(pta_table, 0, sizeof(pta_table));
   memset(fs_pta_table, 0, sizeof(fs_pta_table));
   memset(alloc_table, 0, sizeof(alloc_table));
+  memset(ptr_init_table, 0, sizeof(ptr_init_table));
+  memset(program_point_order_table, 0, sizeof(program_point_order_table));
   unsound_count = 0;
   active_mode = (pta_mode == PTA_MODE_FS) ? PTA_MODE_FS : PTA_MODE_FI;
+  active_program_point_format =
+      (program_point_format == PROGRAM_POINT_SOURCE_LINE)
+          ? PROGRAM_POINT_SOURCE_LINE
+          : PROGRAM_POINT_IR;
   if (active_mode == PTA_MODE_FS)
     parse_fs_pta_file(pta_file_path);
   else
     parse_fi_pta_file(pta_file_path);
   runtime_initialized = 1;
   atexit(report_validation_summary);
-  fprintf(stderr, "[PtaRuntime] Initialized from: %s (mode=%s)\n",
-          pta_file_path, active_mode == PTA_MODE_FS ? "fs" : "fi");
+  fprintf(stderr, "[PtaRuntime] Initialized from: %s (mode=%s, program-point-format=%s)\n",
+          pta_file_path, active_mode == PTA_MODE_FS ? "fs" : "fi",
+          active_program_point_format == PROGRAM_POINT_SOURCE_LINE
+              ? "source-line"
+              : "ir");
+}
+
+void __pta_register_program_point(const char *program_point, uint64_t ordinal) {
+  unsigned int h;
+  ProgramPointOrderEntry *e;
+
+  if (!runtime_initialized || !program_point)
+    return;
+
+  e = program_point_order_find(program_point);
+  if (e) {
+    e->ordinal = ordinal;
+    return;
+  }
+
+  h = hash_str(program_point);
+  e = calloc(1, sizeof(ProgramPointOrderEntry));
+  if (!e) { perror("calloc"); exit(1); }
+  strncpy(e->program_point, program_point, MAX_NAME_LEN - 1);
+  e->ordinal = ordinal;
+  e->next = program_point_order_table[h];
+  program_point_order_table[h] = e;
+}
+
+void __pta_mark_ptr_initialized(void *slot_addr) {
+  uintptr_t addr;
+
+  if (!runtime_initialized || !slot_addr)
+    return;
+
+  addr = (uintptr_t)slot_addr;
+  if (ptr_init_contains(addr))
+    return;
+
+  ptr_init_insert(addr);
 }
 
 /**
@@ -477,12 +651,32 @@ static void report_unsound(const char *ptr_var_name, void *addr,
   fprintf(stderr, "}\n");
 }
 
+static void report_uninitialized_deref(const char *ptr_var_name, void *addr,
+                                       const char *program_point,
+                                       void *ptr_source_addr) {
+  unsound_count++;
+  fprintf(stderr,
+          "[PtaRuntime] UNSOUND: uninitialized dereference encountered for pointer '%s' at program point '@%s' (loaded from slot %p, dereferenced address %p).\n",
+          ptr_var_name, program_point, ptr_source_addr, addr);
+}
+
 void __pta_check_deref(const char *ptr_var_name, void *addr,
-                       const char *program_point) {
+                       const char *program_point,
+                       uint64_t program_point_ordinal,
+                       void *ptr_source_addr) {
   if (!runtime_initialized) return;
 
+  if (ptr_source_addr && !ptr_init_contains((uintptr_t)ptr_source_addr)) {
+    report_uninitialized_deref(ptr_var_name, addr, program_point,
+                               ptr_source_addr);
+    return;
+  }
+
   if (active_mode == PTA_MODE_FS) {
-    FsPtaEntry *pta = fs_pta_find(program_point, ptr_var_name);
+    FsPtaEntry *pta =
+        active_program_point_format == PROGRAM_POINT_SOURCE_LINE
+            ? fs_pta_find_latest_source_line(program_point, ptr_var_name)
+            : fs_pta_find_latest_ir(ptr_var_name, program_point_ordinal);
     if (!pta) {
       report_unsound(ptr_var_name, addr, program_point,
                      "no flow-sensitive points-to fact", NULL, 0);

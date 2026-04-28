@@ -36,6 +36,16 @@ FS testcase files use:
 The instruction index is 0-based within the basic block and counts all
 instructions in block order.
 
+FS testcase files can also use source-line keys with
+`--program-point-format=source-line`:
+
+```text
+@<source-line-number> <ptr_name> -> <pointees...>
+```
+
+In source-line mode, a fact remains active for that pointer until a later line
+provides a replacement fact.
+
 ## Expected runtime summary
 - `[PtaRuntime] SUCCESS: ...` for sound testcase/PTA pairs
 - `[PtaRuntime] FAILURE: ...` for unsound testcase/PTA pairs
